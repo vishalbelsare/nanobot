@@ -4,7 +4,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"time"
+
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/providers"
 )
+
+type User providers.UserInfo
 
 type ClientCapabilities struct {
 	Roots       *RootsCapability    `json:"roots,omitempty"`
@@ -291,6 +295,7 @@ type Tool struct {
 	InputSchema  json.RawMessage  `json:"inputSchema,omitzero"`
 	OutputSchema json.RawMessage  `json:"outputSchema,omitzero"`
 	Annotations  *ToolAnnotations `json:"annotations,omitempty"`
+	Meta         map[string]any   `json:"_meta,omitzero"`
 }
 
 type Icons struct {
@@ -378,18 +383,21 @@ func (s ReadResourceResult) MarshalJSON() ([]byte, error) {
 }
 
 type ResourceContent struct {
-	URI      string `json:"uri"`
-	Name     string `json:"name"`
-	MIMEType string `json:"mimeType"`
-	Text     string `json:"text,omitempty"`
-	Blob     string `json:"blob,omitempty"`
+	URI      string  `json:"uri"`
+	Name     string  `json:"name"`
+	MIMEType string  `json:"mimeType"`
+	Text     *string `json:"text,omitempty"`
+	Blob     *string `json:"blob,omitempty"`
 }
 
 func (r ResourceContent) ToDataURI() string {
-	if r.Text != "" {
-		return "data:" + r.MIMEType + ";base64," + base64.StdEncoding.EncodeToString([]byte(r.Text))
+	if r.Text != nil {
+		return "data:" + r.MIMEType + ";base64," + base64.StdEncoding.EncodeToString([]byte(*r.Text))
 	}
-	return "data:" + r.MIMEType + ";base64," + r.Blob
+	if r.Blob != nil {
+		return "data:" + r.MIMEType + ";base64," + *r.Blob
+	}
+	return "data:" + r.MIMEType + ";base64,"
 }
 
 type ListResourceTemplatesRequest struct {
@@ -484,7 +492,7 @@ type SetLogLevelResult struct {
 }
 
 type SessionMessageHook struct {
-	Accept  bool
-	Message *Message
-	Reason  string
+	Accept  bool     `json:"accept"`
+	Message *Message `json:"message"`
+	Reason  string   `json:"reason"`
 }

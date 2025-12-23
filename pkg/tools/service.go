@@ -257,12 +257,9 @@ func (c *clientFactory) Deserialize(data any) (_ any, err error) {
 }
 
 func (s *Service) GetClient(ctx context.Context, name string) (*mcp.Client, error) {
-	session := mcp.SessionFromContext(ctx)
+	session := mcp.SessionFromContext(ctx).Root()
 	if session == nil {
 		return nil, fmt.Errorf("session not found in context")
-	}
-	for session.Parent != nil {
-		session = session.Parent
 	}
 
 	sessionKey := "clients/" + name
@@ -280,12 +277,9 @@ func (s *Service) GetClient(ctx context.Context, name string) (*mcp.Client, erro
 }
 
 func (s *Service) newClient(ctx context.Context, name string, state *mcp.SessionState) (*mcp.Client, error) {
-	session := mcp.SessionFromContext(ctx)
+	session := mcp.SessionFromContext(ctx).Root()
 	if session == nil {
 		return nil, fmt.Errorf("session not found in context")
-	}
-	for session.Parent != nil {
-		session = session.Parent
 	}
 
 	if session.HookRunner == nil {
@@ -575,23 +569,6 @@ func (o CallOptions) Merge(other CallOptions) (result CallOptions) {
 	result.ToolCallInvocation = complete.Last(o.ToolCallInvocation, other.ToolCallInvocation)
 	result.Meta = complete.MergeMap(o.Meta, other.Meta)
 	return
-}
-
-func (s *Service) getTarget(ctx context.Context, config types.Config, server, tool string) (any, error) {
-	if a, ok := config.Agents[server]; ok {
-		return a, nil
-	}
-	tools, err := s.ListTools(ctx, ListToolsOptions{
-		Servers: []string{server},
-		Tools:   []string{tool},
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(tools) == 1 && len(tools[0].Tools) == 1 {
-		return tools[0].Tools[0], nil
-	}
-	return nil, fmt.Errorf("unknown target %s/%s", server, tool)
 }
 
 func (s *Service) RunHook(ctx context.Context, in, out any, target string) (hasOutput bool, _ error) {
