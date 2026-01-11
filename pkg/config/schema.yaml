@@ -648,6 +648,11 @@ definitions:
         type: string
         description: |
           The encryption key to use for encrypting and decrypting data.
+      apiKeyAuthWebhookUrl:
+        type: string
+        description: |
+          The URL for the API key authentication webhook. When set, API keys
+          will be validated by calling this endpoint.
 
 type: object
 additionalProperties: false
@@ -694,3 +699,13 @@ properties:
       tools, prompts, and other resources that the Nanobot can use.
     additionalProperties:
       $ref: "#/definitions/MCPServer"
+  workspaceId:
+    type: string
+    description: |
+      The workspace ID associated with this Nanobot configuration. This can be used
+      to scope operations to a specific workspace or organization.
+  workspaceBaseUri:
+    type: string
+    description: |
+      The base URI for the workspace associated with this Nanobot configuration.
+      This can be used to construct workspace-specific URLs or API endpoints.
