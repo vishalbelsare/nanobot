@@ -45,32 +45,43 @@ func NewServer(d *sessiondata.Data, r Caller, agents *agents.Agents, name string
 	return s
 }
 
+func (s *Server) withConfig(ctx context.Context) (context.Context, error) {
+	newConfig, err := s.agents.GetConfigForAgent(ctx, s.agentName)
+	if err != nil {
+		return ctx, err
+	}
+	return types.WithConfig(ctx, newConfig), nil
+}
+
 func (s *Server) OnMessage(ctx context.Context, msg mcp.Message) {
 	switch msg.Method {
 	case "initialize":
 		mcp.Invoke(ctx, msg, s.initialize)
+		return
 	case "notifications/initialized":
 		// nothing to do
 	case "tools/list":
 		mcp.Invoke(ctx, msg, s.tools.List)
+		return
 	case "tools/call":
 		mcp.Invoke(ctx, msg, s.tools.Call)
+		return
+	case "resources/read":
+		mcp.Invoke(ctx, msg, s.resourcesRead)
+		return
 	}
 
-	newConfig, err := s.agents.GetConfigForAgent(ctx, s.agentName)
+	ctx, err := s.withConfig(ctx)
 	if err != nil {
 		msg.SendError(ctx, err)
 		return
 	}
-	ctx = types.WithConfig(ctx, newConfig)
 
 	switch msg.Method {
 	case "resources/list":
 		mcp.Invoke(ctx, msg, s.resourcesList)
 	case "resources/templates/list":
 		mcp.Invoke(ctx, msg, s.resourcesTemplatesList)
-	case "resources/read":
-		mcp.Invoke(ctx, msg, s.resourcesRead)
 	case "prompts/list":
 		mcp.Invoke(ctx, msg, s.promptsList)
 	case "prompts/get":
@@ -90,7 +101,7 @@ func messagesToResourceContents(messages []types.Message) ([]mcp.ResourceContent
 		contents = append(contents, mcp.ResourceContent{
 			URI:      fmt.Sprintf(types.MessageURI, msg.ID),
 			MIMEType: types.MessageMimeType,
-			Text:     string(data),
+			Text:     &[]string{string(data)}[0],
 		})
 	}
 	return contents, nil
@@ -134,7 +145,7 @@ func (s *Server) readProgress(ctx context.Context) (ret []mcp.ResourceContent, _
 		{
 			URI:      types.ProgressURI,
 			MIMEType: types.ToolResultMimeType,
-			Text:     string(data),
+			Text:     &[]string{string(data)}[0],
 		},
 	}
 	for _, content := range callResult.Content {
@@ -143,7 +154,7 @@ func (s *Server) readProgress(ctx context.Context) (ret []mcp.ResourceContent, _
 				URI:      content.Resource.URI,
 				Name:     content.Name,
 				MIMEType: content.Resource.MIMEType,
-				Text:     content.Resource.Text,
+				Text:     &content.Resource.Text,
 			})
 		}
 	}
@@ -208,6 +219,11 @@ func (s *Server) resourcesRead(ctx context.Context, _ mcp.Message, request mcp.R
 		return &mcp.ReadResourceResult{
 			Contents: contents,
 		}, nil
+	}
+
+	ctx, err = s.withConfig(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	c := types.ConfigFromContext(ctx)

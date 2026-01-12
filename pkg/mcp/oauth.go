@@ -18,7 +18,10 @@ import (
 	"golang.org/x/oauth2"
 )
 
-var resourceMetadataRegex = regexp.MustCompile(`resource_metadata="([^"]*)"`)
+var (
+	resourceMetadataRegex = regexp.MustCompile(`resource_metadata="([^"]*)"`)
+	scopeRegex            = regexp.MustCompile(`scope="([^"]*)"`)
+)
 
 type oauth struct {
 	redirectURL, clientName string
@@ -80,9 +83,13 @@ func (o *oauth) oauthClient(ctx context.Context, c *HTTPClient, connectURL, auth
 		return nil, fmt.Errorf("failed to parse MCP URL: %w", err)
 	}
 
-	var resourceMetadataURL string
+	var (
+		resourceMetadataURL string
+		scope               string
+	)
 	if authenticateHeader != "" {
 		resourceMetadataURL = parseResourceMetadata(authenticateHeader)
+		scope = parseScopeFromAuthenticateHeader(authenticateHeader)
 	}
 	if resourceMetadataURL == "" {
 		// If the authenticate header was not sent back or it did not have a resource metadata URL, then the spec says we should default to...
@@ -108,6 +115,12 @@ func (o *oauth) oauthClient(ctx context.Context, c *HTTPClient, connectURL, auth
 		}
 	}
 
+	// If no scopes were found in the WWW-Authenticate header, use the ones from the protected resource metadata as a fallback.
+	// This follows the scope selection strategy outlined here: https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization#scope-selection-strategy
+	if scope == "" {
+		scope = strings.Join(protectedResourceMetadata.ScopesSupported, " ")
+	}
+
 	if len(protectedResourceMetadata.AuthorizationServers) == 0 {
 		protectedResourceMetadata.AuthorizationServers = []string{fmt.Sprintf("%s://%s", u.Scheme, u.Host)}
 	}
@@ -117,7 +130,7 @@ func (o *oauth) oauthClient(ctx context.Context, c *HTTPClient, connectURL, auth
 		return nil, fmt.Errorf("failed to get authorization server metadata: %w", err)
 	}
 
-	clientMetadata := authServerMetadataToClientRegistration(authorizationServerMetadata)
+	clientMetadata := authServerMetadataToClientRegistration(authorizationServerMetadata, scope)
 	clientMetadata.RedirectURIs = []string{o.redirectURL}
 	clientMetadata.ClientName = o.clientName
 
@@ -126,36 +139,41 @@ func (o *oauth) oauthClient(ctx context.Context, c *HTTPClient, connectURL, auth
 		return nil, fmt.Errorf("failed to marshal client metadata: %w", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, authorizationServerMetadata.RegistrationEndpoint, bytes.NewReader(b))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create registration request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	// Before trying to register a client, check if there is a static client configuration.
+	var (
+		clientInfo clientRegistrationResponse
+		lookupErr  error
+	)
+	clientInfo.ClientID, clientInfo.ClientSecret, lookupErr = o.clientLookup.Lookup(ctx, protectedResourceMetadata.AuthorizationServers[0])
 
-	resp, err := o.metadataClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to register client: %w", err)
-	}
-	defer resp.Body.Close()
+	// If we didn't get a result from the lookup, register a client dynamically.
+	if lookupErr != nil || clientInfo.ClientID == "" || clientInfo.ClientSecret == "" {
+		req, err := http.NewRequest(http.MethodPost, authorizationServerMetadata.RegistrationEndpoint, bytes.NewReader(b))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create registration request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
 
-	var clientInfo clientRegistrationResponse
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden {
-		// If the registration endpoint produces a not found, then look for static client credentials.
-		clientInfo.ClientID, clientInfo.ClientSecret, err = o.clientLookup.Lookup(ctx, protectedResourceMetadata.AuthorizationServers[0])
+		resp, err := o.metadataClient.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("failed to lookup client credentials: %w", err)
+			return nil, fmt.Errorf("failed to register client: %w", err)
 		}
-		if clientInfo.ClientID == "" {
-			return nil, fmt.Errorf("client registration failed with status %s and no client credentials were found", resp.Status)
-		}
-	} else if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpeted status registering client (%d): %s", resp.StatusCode, string(body))
-	} else {
-		clientInfo, err = parseClientRegistrationResponse(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse client registration response: %w", err)
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(resp.Body)
+			if lookupErr != nil {
+				err = fmt.Errorf("unexpected status registering client (%d): %s - static OAuth client lookup also failed: %v", resp.StatusCode, string(body), lookupErr)
+			} else {
+				err = fmt.Errorf("unexpected status registering client (%d): %s", resp.StatusCode, string(body))
+			}
+			return nil, err
+		} else {
+			clientInfo, err = parseClientRegistrationResponse(resp.Body)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse client registration response: %w", err)
+			}
 		}
 	}
 
@@ -189,9 +207,22 @@ func (o *oauth) oauthClient(ctx context.Context, c *HTTPClient, connectURL, auth
 		return nil, fmt.Errorf("failed to create state: %w", err)
 	}
 
+	authEndpoint, err := url.Parse(authorizationServerMetadata.AuthorizationEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse authorization endpoint: %w", err)
+	}
+
 	// Redirect user to consent page to ask for permission
 	// for the scopes specified above.
-	authURL := conf.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.S256ChallengeOption(verifier), oauth2.SetAuthURLParam("resource", connectURL))
+	authCodeURLOpts := []oauth2.AuthCodeOption{oauth2.AccessTypeOffline, oauth2.S256ChallengeOption(verifier)}
+	if authEndpoint.Host != "login.microsoftonline.com" {
+		// This is a hacky workaround to avoid providing the `resource` parameter to Microsoft Entra.
+		// Entra does not like the resource parameter, and including it will often cause things to fail.
+		// VSCode does something similar to this.
+		authCodeURLOpts = append(authCodeURLOpts, oauth2.SetAuthURLParam("resource", connectURL))
+	}
+
+	authURL := conf.AuthCodeURL(state, authCodeURLOpts...)
 	handled, err := o.callbackHandler.HandleAuthURL(ctx, c.displayName, authURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to handle auth url %s: %w", authURL, err)
@@ -375,6 +406,17 @@ func parseResourceMetadata(authenticateHeader string) string {
 	return matches[1]
 }
 
+// parseScopeFromAuthenticateHeader extracts the scope parameter from a Bearer authenticate header
+func parseScopeFromAuthenticateHeader(authenticateHeader string) string {
+	matches := scopeRegex.FindStringSubmatch(authenticateHeader)
+
+	if len(matches) < 2 {
+		return ""
+	}
+
+	return matches[1]
+}
+
 // protectedResourceMetadata represents OAuth 2.0 Protected Resource Metadata
 // as defined in RFC 8707
 type protectedResourceMetadata struct {
@@ -540,7 +582,7 @@ type clientRegistrationMetadata struct {
 	SoftwareVersion string `json:"software_version,omitempty"`
 }
 
-func authServerMetadataToClientRegistration(authServer authorizationServerMetadata) clientRegistrationMetadata {
+func authServerMetadataToClientRegistration(authServer authorizationServerMetadata, scope string) clientRegistrationMetadata {
 	merged := clientRegistrationMetadata{}
 
 	// Set default values based on OAuth 2.0 specifications
@@ -566,10 +608,10 @@ func authServerMetadataToClientRegistration(authServer authorizationServerMetada
 		merged.ResponseTypes = []string{"code"}
 	}
 
-	// scope: combine scopes from both sources, preferring protected resource
-	if len(authServer.ScopesSupported) > 0 {
-		merged.Scope = strings.Join(authServer.ScopesSupported, " ")
+	if scope != "" {
+		merged.Scope = scope
 	}
+
 	// Note: redirect_uris, logo_uri, contacts, jwks, software_id, and software_version
 	// are typically client-specific and would need to be provided by the client application
 	// These fields are left empty as they cannot be derived from server metadata
